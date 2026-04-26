@@ -14,7 +14,8 @@
     "sidePanel",
     "scripting",
     "storage",
-    "tabs"
+    "tabs",
+    "microphone"
   ],
   "host_permissions": [
     "<all_urls>"
