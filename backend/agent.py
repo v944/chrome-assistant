@@ -1,8 +1,13 @@
 import os
 import logging
+import time
 from typing import Optional
 
 logging.basicConfig(level=logging.DEBUG)
+
+# Search cache: {query: (timestamp, results)}
+SEARCH_CACHE = {}
+CACHE_TTL = 300  # 5 minutes
 
 def run_agent(
     message: str,
@@ -15,6 +20,20 @@ def run_agent(
     logging.info(f"=== AGENT CALLED ===")
     logging.info(f"message: {message}")
     logging.info(f"page_content length: {len(page_content)}")
+    logging.info(f"session_history: {len(session_history) if session_history else 0} messages")
+    
+    # Check for repeat/history commands
+    message_lower = message.lower()
+    if "повтори" in message_lower or "ещё раз" in message_lower or "снова" in message_lower:
+        if session_history and len(session_history) > 0:
+            last_user_msg = None
+            for msg in reversed(session_history):
+                if msg.get("role") == "user":
+                    last_user_msg = msg.get("content", "")
+                    break
+            if last_user_msg:
+                message = last_user_msg
+                message_lower = message.lower()
     
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
@@ -30,9 +49,10 @@ def run_agent(
     # Check if we need to search - more triggers
     search_triggers = [
         "поиск", "search", "найди в интернете", "google", "найди",
-        "альтернатив", "similar", "related", "другие", "ещё",
+        "альтернатив", "related", "other similar",
         "more info", "more about", "similar to", "web search",
-        "загугли", "в интернете", "в сети"
+        "загугли", "в интернете", "в сети",
+        "повтори", "снова", "ещё раз"
     ]
     needs_search = any(word in message_lower for word in search_triggers)
     
@@ -83,9 +103,19 @@ def run_agent(
         # Check if search is needed - separate from page content
         if needs_search:
             search_query = message
+            category = None
+            
             # Extract actual query - remove search trigger words
             for word in ["загугли", "поиск", "search", "google", "найди в интернете", "в интернете", "в сети"]:
                 search_query = search_query.replace(word, "").strip()
+            
+            # Extract category
+            if any(w in message_lower for w in ["картинк", "фото", "image", " foto"]):
+                category = "image"
+            elif any(w in message_lower for w in ["видео", "youtube", "видеок", "video"]):
+                category = "video"
+            elif any(w in message_lower for w in ["новост", "новости", "news"]):
+                category = "news"
             
             # Check if user wants alternatives - use separate search for alternatives
             is_alternatives = any(w in message_lower for w in ["альтернатив", "другие", "ещё", "alternative", "аналог", "конкурент"])
@@ -97,48 +127,57 @@ def run_agent(
                     search_query = page_details.get('title', '')
             
             logging.info(f"=== WEB SEARCH (no page context): {search_query} ===")
+            logging.info(f"=== CATEGORY: {category} ===")
             
-            # Perform EXA search - DON'T include page content for web search
+            # Check cache first
+            cache_key = search_query.lower()
+            if cache_key in SEARCH_CACHE:
+                cached_time, cached_results = SEARCH_CACHE[cache_key]
+                if time.time() - cached_time < CACHE_TTL:
+                    search_results = cached_results
+                    logging.info(f"=== USING CACHED RESULTS ===")
+                else:
+                    del SEARCH_CACHE[cache_key]
+            
+# Perform EXA search if not cached
+            search_results = None
             try:
                 from exa_py import Exa
                 exa_api_key = os.getenv("EXA_API_KEY")
                 if exa_api_key:
                     exa = Exa(api_key=exa_api_key)
-                    search_results = exa.search_and_contents(
-                        search_query,
-                        num_results=10,
-                        text=True
-                    )
-                    
-                    search_context = f"\n\n=== WEB SEARCH RESULTS for: {search_query} ===\n"
-                    for r in search_results.results:
-                        search_context += f"\n- {r.title}\n  {r.url}\n"
-                        if r.text:
-                            search_context += f"  {r.text[:300]}...\n"
-                    
-                    # Get AI response with search results - no page content needed
-                    user_msg_final = f"Web search results:\n{search_context}\n\nQuestion: {message}\n\n"
-                    user_msg_final += "Напиши ответ с описанием.\n"
-                    user_msg_final += "Добавь в конце: 'Нажми на любую ссылку ниже, чтобы открыть.'\n"
-                    
-                    response2 = client.chat.completions.create(
-                        model="meta-llama/llama-3.1-8b-instruct",
-                        messages=[
-                            {"role": "system", "content": "Отвечай на русском языке. Пиши простые URL без [текст](url)."}
-                        ] + ([{"role": "user", "content": user_msg_final}]),
-                        max_tokens=400,
-                        temperature=0.7
-                    )
-                    
-                    final_result = response2.choices[0].message.content
-                    logging.info(f"=== FINAL RESPONSE WITH SEARCH ===")
-                    return {
-                        "response": final_result,
-                        "current_status": "completed",
-                        "search_results": [
-                            {"title": r.title, "url": r.url} for r in search_results.results
-                        ]
-                    }
+                    search_results = exa.search_and_contents(search_query, text=True, num_results=10)
+                    SEARCH_CACHE[cache_key] = (time.time(), search_results)
+                
+                search_context = f"\n\n=== WEB SEARCH RESULTS for: {search_query} ===\n"
+                for r in search_results.results:
+                    search_context += f"\n- {r.title}\n  {r.url}\n"
+                    if r.text:
+                        search_context += f"  {r.text[:300]}...\n"
+                
+                user_msg_final = f"Web search results:\n{search_context}\n\nQuestion: {message}\n\n"
+                user_msg_final += "Напиши ответ с описанием.\n"
+                user_msg_final += "Добавь в конце: 'Нажми на любую ссылку ниже, чтобы открыть.'\n"
+                
+                response2 = client.chat.completions.create(
+                    model="meta-llama/llama-3.1-8b-instruct",
+                    messages=[
+                        {"role": "system", "content": "Отвечай на русском языке. Пиши простые URL без [текст](url)."}
+                    ] + ([{"role": "user", "content": user_msg_final}]),
+                    max_tokens=400,
+                    temperature=0.7
+                )
+                
+                final_result = response2.choices[0].message.content
+                logging.info(f"=== FINAL RESPONSE WITH SEARCH ===")
+                return {
+                    "response": final_result,
+                    "current_status": "completed",
+                    "category": category,
+                    "search_results": [
+                        {"title": r.title, "url": r.url} for r in search_results.results
+                    ]
+                }
             except Exception as search_err:
                 logging.error(f"Search error: {search_err}")
                 return {"response": "Ошибка поиска. " + str(search_err), "current_status": "completed"}
